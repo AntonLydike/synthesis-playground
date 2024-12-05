@@ -1,15 +1,16 @@
 from __future__ import annotations
-from abc import ABC, abstractmethod
-from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any, Callable
-from .ordered import Ordered
+from abc import ABC
+from dataclasses import dataclass
+from typing import Sequence
+
+from synth.ordered import Ordered
+from synth.symbols import Nonterminal
 
 
-@dataclass(frozen=True, slots=True, eq=True, unsafe_hash=True)
-class ASTNode(Ordered):
+@dataclass(frozen=True, slots=True, unsafe_hash=True)
+class Node(Ordered):
     name: str
-    children: tuple[ASTNode | ASTValue | Hole, ...]
+    children: tuple[Node | Value | Nonterminal, ...]
 
     @property
     def holes_indices(self) -> tuple[int, ...]:
@@ -17,19 +18,19 @@ class ASTNode(Ordered):
         Tuple of indices indicating which children of this node are holes.
         """
         return tuple(
-            idx for idx, e in enumerate(self.children) if isinstance(e, Hole)
+            idx for idx, e in enumerate(self.children) if isinstance(e, Nonterminal)
         )
     
     @property
-    def holes(self) -> tuple[Hole, ...]:
+    def holes(self) -> tuple[Nonterminal, ...]:
         """
         All children who are Holes of this AST Node
         """
         return tuple(
-            c for c in self.children if isinstance(c, Hole)
+            c for c in self.children if isinstance(c, Nonterminal)
         )
 
-    def replace_children(self, ids: Sequence[int], replacements: Sequence[ASTNode | ASTValue | Hole]) -> ASTNode:
+    def replace_children(self, ids: Sequence[int], replacements: Sequence[Node | Value | Nonterminal]) -> Node:
         """
         Clones the ASTNode, applying replacements.
 
@@ -43,7 +44,7 @@ class ASTNode(Ordered):
         repl = iter(replacements)
         id_set = set(ids)
     
-        return ASTNode(
+        return Node(
             self.name,
             tuple(c if i not in id_set else next(repl) for i, c in enumerate(self.children))
         )
@@ -51,36 +52,32 @@ class ASTNode(Ordered):
     def __str__(self) -> str:
         return self.to_string()
 
-    def to_string(self, hole_mapper: Callable[[Hole], str] | str = "🕳") -> str:
+    def to_string(self) -> str:
         kids = []
         for c in self.children:
             match c:
-                case Hole() as h:
-                    kids.append(hole_mapper if isinstance(hole_mapper, str) else hole_mapper(h))
-                case ASTNode() as node:
+                case Node() as node:
                     kids.append(str(node))
-                case ASTValue() as val:
+                case Value() as val:
                     kids.append(str(val))
+                case Nonterminal() as sym:
+                    kids.append(str(sym))
                 case v:
                     raise ValueError("Unknown value in children", v)
         
-        return f"{self.name}({' '.join(kids)})"
-
-    def __lt__(self, other):
-        if isinstance(other, ASTNode):
-            return (self.name, *self.children) < (other.name, *other.children)
+        return f"{self.name}({', '.join(kids)})"
 
     def key(self):
         return tuple((self.name, *(x.key() for x in self.children)))
 
 
 @dataclass(frozen=True, slots=True, eq=True, unsafe_hash=True)
-class ASTValue(Ordered, ABC):
+class Value(Ordered, ABC):
     pass
 
 
 @dataclass(frozen=True, slots=True, eq=True, unsafe_hash=True)
-class ASTInt(ASTValue):
+class Int(Value):
     val: int
 
     def __str__(self):
@@ -91,7 +88,7 @@ class ASTInt(ASTValue):
 
 
 @dataclass(frozen=True, slots=True, eq=True, unsafe_hash=True)
-class ASTString(ASTValue):
+class String(Value):
     val: str
 
     def __str__(self):
@@ -102,7 +99,7 @@ class ASTString(ASTValue):
 
 
 @dataclass(frozen=True, slots=True, eq=True, unsafe_hash=True)
-class ASTVar(ASTValue):
+class Var(Value):
     name: str
 
     def __str__(self):
@@ -112,27 +109,30 @@ class ASTVar(ASTValue):
         return self.name,
 
 
+@dataclass(frozen=True, slots=True)
+class SymmetricNode(Node):
+    def __eq__(self, other):
+        if isinstance(other, SymmetricNode) and set(other.children) == set(self.children):
+            return True
+        return Node.__eq__(self, other)
 
-class GenerationConstraint:
-    @abstractmethod
-    def is_valid_entry(self, ast: ASTNode | ASTValue):
-        """
-        check if an ast node or value (without holes) is a valid placement candidate here
-        """
-        raise NotImplementedError()
+    def replace_children(self, ids: Sequence[int], replacements: Sequence[Node | Value | Nonterminal]) -> Node:
+        match tuple(replacements):
+            case (lhs, rhs):
+                return SymmetricNode(self.name, (lhs, rhs))
+            case (a,):
+                SymmetricNode(
+                    self.name,
+                    (a, self.children[1]) if ids[0] == 0 else (self.children[0], a),
+                )
+            case ():
+                return self
 
+    def __hash__(self):
+        if self.holes:
+            return super().__hash__()
+        return hash((self.name, *sorted(self.children)))
 
-@dataclass(frozen=True, slots=True, unsafe_hash=True, eq=True)
-class Hole(Ordered):
-    fill: Any
-
-    constraints: tuple[GenerationConstraint, ...] = field(default=())
-
-    def __str__(self) -> str:
-        return str(self.fill)
-
-    def key(self):
-        return str(self.fill),
-
-    def can_substitute(self, ast: ASTNode | ASTValue):
-        return all(c.is_valid_entry(ast) for c in self.constraints)
+    def __lt__(self, other):
+        if isinstance(other, Node):
+            return (self.name, *self.children) < (other.name, *other.children)

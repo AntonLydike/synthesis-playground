@@ -1,24 +1,24 @@
 from dataclasses import dataclass
 from typing import Callable, Any
 
-from .ast import ASTNode, ASTValue, ASTVar, ASTInt, ASTString
+import synth.ast as ast
 
 
 @dataclass
 class ASTEvaluator:
-    evals: dict[str, Callable[[ASTNode, tuple[Any, ...]], Any]]
+    evals: dict[str, Callable[[ast.Node, tuple[Any, ...]], Any]]
 
-    def eval(self, node: ASTNode | ASTValue, binds: dict[str, Any]) -> ASTValue:
+    def eval(self, node: ast.Node | ast.Value, binds: dict[str, Any]) -> ast.Value:
         match node:
-            case ASTVar(name):
+            case ast.Var(name):
                 return binds[name]
-            case ASTInt(val):
+            case ast.Int(val):
                 return val
-            case ASTString(val):
+            case ast.String(val):
                 return val
-            case ASTValue() as val:
+            case ast.Value() as val:
                 return val
-            case ASTNode(name, children):
+            case ast.Node(name, children):
                 return self.evals[name](node, tuple(
                     self.eval(child, binds) for child in children
                 ))

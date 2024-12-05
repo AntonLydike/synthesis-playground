@@ -1,123 +1,126 @@
 from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import itertools
-from typing import Sequence
+from collections import defaultdict
+
 
 from synth.constraints import DoesNotEvaluateTo, DistinctChildren
-from .ast import ASTInt, ASTNode, Hole, ASTValue, ASTVar
-from .grammar import ProductionRule, Self
-from .eval import ASTEvaluator
+from synth import ast
+from synth.ast import Node, Value, SymmetricNode
+from synth.grammar import ProductionRule
+from synth.eval import ASTEvaluator
+from synth.symbols import Nonterminal
 
 
-@dataclass(frozen=True, unsafe_hash=True, eq=True, slots=True)
+@dataclass(unsafe_hash=True, eq=True, slots=True)
 class Grammar:
-    terminals: tuple[ProductionRule, ...]
-    nonterminals: tuple[ProductionRule, ...]
+    start: Nonterminal
+    _maps: dict[str, list[ProductionRule]] = field(default_factory=lambda: defaultdict(list), init=False)
+
+    def __iadd__(self, other: ProductionRule):
+        self._maps[other.lhs.name].append(other)
+        return self
 
     def __str__(self):
-        return "\n".join([
-            "Grammar:",
-            *(
-                "  " + str(x) for x in self.nonterminals
-            ),
-            *(
-                "  " + str(x) for x in self.terminals
-            )
-        ])
+        res = ['Grammar:']
+        longest_name = max(len(sym) for sym in self._maps)
+        space = ' ' * longest_name
+        # collapse rules without constraints together
+        for sym, rules in self._maps.items():
+            if all(not rule.constraints for rule in rules):
+                res.append(f"{sym:<{longest_name}} ::= {' | '.join(str(x.rhs) for x in rules)}")
+            else:
+                res.append(f'{sym:<{longest_name}} ::= ')
+                for rule in rules:
+                    constraint_str = ', '.join(str(c) for c in rule.constraints)
+                    constr = "" if not rule.constraints else f": {constraint_str}"
+                    res.append(f'{space}     {rule.rhs}{constr}')
 
-    def enumerate_bottom_up(self, depth: int, screen: EnumerationFilter) -> Iterable[ASTNode | ASTValue]:
-        starting_nonterm = self.nonterminals[0]
+        return "\n\t".join(res)
 
-        for prod in starting_nonterm.produce:
-            for ast in fill_holes_of(prod, depth=depth):
+    def enumerate_bottom_up(self, depth: int, screen: EnumerationFilter) -> Iterable[Node | Value]:
+        for prod in self._maps[self.start.name]:
+            for ast in self.perform_substitution(prod, depth=depth):
                 if screen.is_useful_program(ast):
                     yield ast
                     screen.register_program(ast)
 
+    def enumerate_forever(self, screen: EnumerationFilter):
+        for depth in range(0, 10000):
+            yield from self.enumerate_bottom_up(depth, screen)
 
-def fill_holes_of(production: ASTNode | Hole, depth: int) -> Iterable[ASTNode | ASTValue]:
-    """
-    Fill all holes in `production` with all possible productions of their production rules.
-    """
-    # if we run out of depth, return empty
-    if depth <= 0:
-        return
-    match production:
-        case Hole(fill=f) as h if isinstance(f, ProductionRule):
-            # replace holes by their definition
-            assert isinstance(f, ProductionRule)
-            assert isinstance(h, Hole)
-            yield from filter(
-                h.can_substitute,
-                itertools.chain(*(fill_holes_of(val, depth=depth) for val in f.produce))
-            )
-        case ASTNode() as node:
-            hole_ids = node.holes_indices
-            holes = node.holes
-            
-            for fill in itertools.product(*(fill_holes_of(hole, depth=depth - 1) for hole in holes)):
-                yield node.replace_children(hole_ids, fill)
-        case ASTValue() as val:
-            if depth != 1:
-                return
-            yield val
-        case _:
-            raise ValueError(f"Unknown hole", production)
+    def perform_substitution(self, production: ProductionRule | Nonterminal, depth: int) -> Iterable[Node | Value]:
+        """
+        Fill all holes in `production` with all possible productions of their production rules.
+        """
+        # if we run out of depth, return empty
+        if depth <= 0:
+            return
 
-
-@dataclass(frozen=True, slots=True)
-class AddNode(ASTNode):
-    def __eq__(self, other):
-        if isinstance(other, AddNode) and set(other.children) == set(self.children):
-            return True
-        return super().__eq__(other)
-
-    def replace_children(self, ids: Sequence[int], replacements: Sequence[ASTNode | ASTValue | Hole]) -> ASTNode:
-        match tuple(replacements):
-            case (lhs, rhs):
-                return AddNode('add', (lhs, rhs))
-            case (a,):
-                AddNode(
-                    'add',
-                    (a, self.children[1]) if ids[0] == 0 else (self.children[0], a),
+        # If we're given a nonterminal instead of a rule, iterate over all rues of the nonterminal
+        # and check against the nonterminals constraints
+        if isinstance(production, Nonterminal):
+            sym: Nonterminal = production
+            for rule in self._maps[sym.name]:
+                yield from filter(
+                    sym.accepts,
+                    self.perform_substitution(rule, depth)
                 )
-            case ():
-                return self
+            return
 
-    def __hash__(self):
-        if self.holes:
-            return super().__hash__()
-        return hash((self.name, *sorted(self.children)))
-
-    def __lt__(self, other):
-        if isinstance(other, ASTNode):
-            return (self.name, *self.children) < (other.name, *other.children)
-
-
+        # specialise on what the rule produces:
+        match production.rhs:
+            # another nontermial => recurse without reducing depth
+            case Nonterminal() as sym:
+                # replace symbol by all things that can be produced from that symbol
+                # apply constraints
+                yield from filter(
+                    production.can_substitute,
+                    itertools.chain(*(self.perform_substitution(val, depth=depth) for val in self._maps[sym.name]))
+                )
+            # an ast node => recurse on all children of the AST node that are nonterminals, reducing depth:
+            case Node() as node:
+                # find all "holes" in the symbol
+                hole_ids = node.holes_indices
+                holes = node.holes
+                # fill them
+                for fill in itertools.product(*(self.perform_substitution(hole, depth=depth-1) for hole in holes)):
+                    new_node = node.replace_children(hole_ids, fill)
+                    # check constraints of production rule
+                    if production.can_substitute(new_node):
+                        yield new_node
+            # a Terminal => return terminal:
+            case Value() as val:
+                if not production.can_substitute(val):
+                    return
+                yield val
+            # something else => Error:
+            case _:
+                raise ValueError(f"Unknown hole", production)
 
 
 class EnumerationFilter(ABC):
     @abstractmethod
-    def is_useful_program(self, ast: ASTNode | ASTValue) -> bool:
+    def is_useful_program(self, ast: Node | Value) -> bool:
         pass
 
     @abstractmethod
-    def register_program(self, ast: ASTNode | ASTValue):
+    def register_program(self, ast: Node | Value):
         pass
 
 
 class EquivalenceScreen(EnumerationFilter):
-    generated_programs: set[ASTNode | ASTValue]
+    generated_programs: set[Node | Value]
 
     def __init__(self):
         self.generated_programs = set()
 
-    def is_useful_program(self, ast: ASTNode | ASTValue) -> bool:
+    def is_useful_program(self, ast: Node | Value) -> bool:
         return ast not in self.generated_programs
 
-    def register_program(self, ast: ASTNode | ASTValue):
+    def register_program(self, ast: Node | Value):
         self.generated_programs.add(ast)
 
 
@@ -128,23 +131,6 @@ if __name__ == '__main__':
     var := x | y
     """
 
-    t_int = ProductionRule('int', (
-        ASTInt(0),
-        ASTInt(1),
-    ))
-    t_var = ProductionRule('var', (
-        ASTVar('x'),
-        ASTVar('y'),
-    ))
-
-    """
-    Siddharth says:
-        A = Nonterminal("A")
-        t_int = Terminal('int')
-        a2int = ProductionRule(A, t_int)
-        a2add = ProductionRule(A, ASTNode('add', l=A, r=A))
-    """
-
     evaluator = ASTEvaluator(
         {
             'add': lambda n, vals: vals[0] + vals[1],
@@ -153,36 +139,55 @@ if __name__ == '__main__':
     )
     vars = {'x': 1, 'y': 2}
     C_Nonzero = DoesNotEvaluateTo(0, evaluator, vars)
+
+
+    val = Nonterminal('val')
+    A = Nonterminal('A')
+
+    g = Grammar(A)
+
+    g += ProductionRule(val, ast.Int(0))
+    g += ProductionRule(val, ast.Int(1))
+    g += ProductionRule(val, ast.Var('x'))
+    g += ProductionRule(val, ast.Var('y'))
+
+    g += ProductionRule(A, val)
+    g += ProductionRule(
+        A,
+        SymmetricNode('add', (A + C_Nonzero, A + C_Nonzero)),
+        (DistinctChildren(),)
+    )
+    g += ProductionRule(
+        A,
+        ast.Node('sub', (A, A + C_Nonzero)),
+        (DistinctChildren(),)
+    )
+
+    """
+    Siddharth says:
+        A = Nonterminal("A")
+        t_int = Terminal('int')
+        a2int = ProductionRule(A, t_int)
+        a2add = ProductionRule(A, ASTNode('add', l=A, r=A))
+    """
     #C_Notone = DoesNotEvaluateTo(1, evaluator, vars)
 
-    A = ProductionRule('A', (
-        AddNode('add', (Hole(Self, (C_Nonzero,)), Hole(Self, (C_Nonzero,)))),
-        ASTNode('sub', (Hole(Self, (C_Nonzero,)), Hole(Self, (C_Nonzero,)))),
-        Hole(t_int),
-        Hole(t_var),
-    ))
-
-    simple_g = Grammar(
-        (t_int, t_var),
-        (A,),
-    )
-    print(simple_g)
-    print(repr(simple_g))
+    print(g)
     screen = EquivalenceScreen()
 
 
     print("\ndepth = 1")
-    for ast in simple_g.enumerate_bottom_up(depth=1, screen=screen):
+    for ast in g.enumerate_bottom_up(depth=1, screen=screen):
         print(ast, end="")
         print(" = ", end="")
         print(evaluator.eval(ast, vars))
     print("\ndepth = 2")
-    for ast in simple_g.enumerate_bottom_up(depth=2, screen=screen):
+    for ast in g.enumerate_bottom_up(depth=2, screen=screen):
         print(ast, end="")
         print(" = ", end="")
         print(evaluator.eval(ast, vars))
     print("\ndepth = 3")
-    for ast in simple_g.enumerate_bottom_up(depth=3, screen=screen):
+    for ast in g.enumerate_bottom_up(depth=3, screen=screen):
         print(ast, end="")
         print(" = ", end="")
         print(evaluator.eval(ast, vars))
